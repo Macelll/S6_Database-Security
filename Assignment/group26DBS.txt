@@ -1,0 +1,340 @@
+-- Create the database
+CREATE DATABASE APU_SPORTS;
+USE APU_SPORTS;
+
+-- Create the necessary tables
+CREATE TABLE Categories (
+    CategoryID INT PRIMARY KEY,
+    CategoryName NVARCHAR(50)
+);
+
+CREATE TABLE Equipment (
+    EquipmentID INT PRIMARY KEY,
+    EquipmentName NVARCHAR(100),
+    Price DECIMAL(10, 2),
+    CategoryID INT,
+    QuantityInStock INT,
+    CountryProduced NVARCHAR(50),
+    IsImported BIT,
+    CONSTRAINT FK_Category FOREIGN KEY (CategoryID) REFERENCES Categories(CategoryID)
+);
+
+CREATE TABLE Members (
+    MemberID INT PRIMARY KEY,
+    NationalIDOrPassport NVARCHAR(100),
+    Name NVARCHAR(100),
+    Address NVARCHAR(200),
+    PhoneNumber NVARCHAR(20),
+    MemberStatus NVARCHAR(20),
+    LoginID NVARCHAR(50),
+    UNIQUE (LoginID)
+);
+
+CREATE TABLE Transactions (
+    TransactionID INT PRIMARY KEY,
+    MemberID INT,
+    TransactionDate DATETIME,
+    CONSTRAINT FK_Member FOREIGN KEY (MemberID) REFERENCES Members(MemberID)
+);
+
+CREATE TABLE TransactionItems (
+    TransactionItemID INT PRIMARY KEY,
+    TransactionID INT,
+    EquipmentID INT,
+    Quantity INT,
+    CONSTRAINT FK_Transaction FOREIGN KEY (TransactionID) REFERENCES Transactions(TransactionID),
+    CONSTRAINT FK_Equipment FOREIGN KEY (EquipmentID) REFERENCES Equipment(EquipmentID)
+);
+
+-- Create Users table to store user details
+CREATE TABLE Users (
+    UserID INT PRIMARY KEY,
+    UserName NVARCHAR(50),
+    Password NVARCHAR(100)
+);
+
+-- Create logins and users
+CREATE LOGIN MemberUser WITH PASSWORD = 'MemberUserPassword';
+CREATE USER MemberUser FOR LOGIN MemberUser;
+CREATE LOGIN ClerkUser WITH PASSWORD = 'ClerkUserPassword';
+CREATE USER ClerkUser FOR LOGIN ClerkUser;
+CREATE LOGIN DBAUser WITH PASSWORD = 'DBAUserPassword';
+CREATE USER DBAUser FOR LOGIN DBAUser;
+CREATE LOGIN ManagementUser WITH PASSWORD = 'ManagementUserPassword';
+CREATE USER ManagementUser FOR LOGIN ManagementUser;
+
+-- Encrypt sensitive fields
+ALTER TABLE Members
+ADD NationalIDOrPassportEncrypt VARBINARY(128);
+ALTER TABLE Members
+ADD ENCRYPTED WITH (COLUMN_ENCRYPTION_KEY = MemberKey, ENCRYPTION_TYPE = Randomized, ALGORITHM = AEAD_AES_256_CBC_HMAC_SHA_256) MemberDetails;
+
+-- Create necessary roles
+CREATE ROLE MemberRole;
+CREATE ROLE ClerkRole;
+CREATE ROLE DBARole;
+CREATE ROLE ManagementRole;
+
+-- Assign permissions to roles
+GRANT SELECT, INSERT, UPDATE ON Categories TO ClerkRole;
+GRANT SELECT, INSERT, UPDATE, DELETE ON Equipment TO ClerkRole;
+GRANT SELECT, INSERT, UPDATE, DELETE ON Members TO ClerkRole;
+GRANT SELECT, INSERT, UPDATE ON Transactions TO ClerkRole;
+GRANT SELECT, INSERT, UPDATE ON TransactionItems TO ClerkRole;
+
+GRANT SELECT, INSERT, UPDATE ON Categories TO MemberRole;
+GRANT SELECT, INSERT, UPDATE ON Equipment TO MemberRole;
+GRANT SELECT ON Members TO MemberRole;
+GRANT SELECT, INSERT, UPDATE ON Transactions TO MemberRole;
+
+GRANT SELECT ON Categories TO DBARole;
+GRANT SELECT, INSERT, UPDATE ON Users TO DBARole;
+
+GRANT SELECT ON Categories TO ManagementRole;
+
+-- Add users to roles
+ALTER ROLE MemberRole ADD MEMBER MemberUser;
+ALTER ROLE ClerkRole ADD MEMBER ClerkUser;
+ALTER ROLE DBARole ADD MEMBER DBAUser;
+ALTER ROLE ManagementRole ADD MEMBER ManagementUser;
+
+-- Grant EXECUTE permission to DBARole on the procedure that handles encryption key management
+GRANT EXECUTE ON dbo.sp_add_db_encryption_key to DBARole;
+
+-- Grant EXECUTE permission to ClerkRole and MemberRole on procedures that allow them to manage their transactions and memberships
+GRANT EXECUTE ON dbo.InsertTransaction to ClerkRole, MemberRole;
+GRANT EXECUTE ON dbo.UpdateTransaction to ClerkRole, MemberRole;
+GRANT EXECUTE ON dbo.AddMember to ClerkRole, MemberRole;
+GRANT EXECUTE ON dbo.UpdateMember to ClerkRole, MemberRole;
+
+-- Assign necessary permissions to ManagementRole
+GRANT SELECT ON Members TO ManagementRole;
+GRANT SELECT ON Equipment TO ManagementRole;
+GRANT SELECT ON Transactions TO ManagementRole;
+GRANT SELECT ON TransactionItems TO ManagementRole;
+
+-- Create a view for members with decryption (accessible to Members only)
+CREATE VIEW MemberDetails AS
+SELECT
+    MemberID,
+    CONVERT(NVARCHAR(100), DECRYPTBYKEY(MemberDetails)) AS NationalIDOrPassport,
+    Name,
+    Address,
+    PhoneNumber,
+    MemberStatus,
+    LoginID
+FROM Members
+WHERE HAS_PERMS_BY_NAME('Members', 'SELECT') = 1;
+
+-- Create a view for member details with encryption hidden (Clerks and Management only)
+CREATE VIEW MemberDetailsHidden AS
+SELECT
+    MemberID,
+    Name,
+    Address,
+    PhoneNumber,
+    MemberStatus,
+    LoginID
+FROM Members;
+
+-- Implement row-level security for MemberDetails view (Members only)
+CREATE SECURITY POLICY MemberDetailsPolicy
+ADD FILTER PREDICATE SCHEMA_MEMBER.FilterMemberDetails(Members.MemberID) ON dbo.MemberDetails
+WITH (STATE = ON);
+
+-- Create a table to capture audit activities
+CREATE TABLE AuditLog (
+    AuditLogID INT PRIMARY KEY,
+    ActivityType NVARCHAR(50),
+    TableName NVARCHAR(50),
+    RecordID INT,
+    UserID INT,
+    Timestamp DATETIME
+);
+
+-- Create a stored procedure to log audit activities
+CREATE PROCEDURE LogAuditActivity
+    @ActivityType NVARCHAR(50),
+    @TableName NVARCHAR(50),
+    @RecordID INT,
+    @UserID INT
+AS
+BEGIN
+    INSERT INTO AuditLog (ActivityType, TableName, RecordID, UserID, Timestamp)
+    VALUES (@ActivityType, @TableName, @RecordID, @UserID, GETDATE());
+END;
+
+-- Use triggers to automatically log audit activities
+
+-- Trigger for login/logout activities
+CREATE TRIGGER LogLoginLogout
+ON ALL SERVER WITH EXECUTE AS 'DBAUser'
+FOR LOGON
+AS
+BEGIN
+    DECLARE @LoginName NVARCHAR(100);
+    SET @LoginName = ORIGINAL_LOGIN();
+
+    EXEC LogAuditActivity 'Login', 'Server', NULL, (SELECT UserID FROM Users WHERE UserName = @LoginName);
+END;
+
+-- Trigger for database structural changes
+CREATE TRIGGER LogDBStructuralChanges
+ON DATABASE
+FOR DDL_DATABASE_LEVEL_EVENTS
+AS
+BEGIN
+    DECLARE @EventData XML = EVENTDATA();
+    DECLARE @EventType NVARCHAR(100) = @EventData.value('(/EVENT_INSTANCE/EventType)[1]', 'NVARCHAR(100)');
+    DECLARE @ObjectName NVARCHAR(100) = @EventData.value('(/EVENT_INSTANCE/ObjectName)[1]', 'NVARCHAR(100)');
+
+    EXEC LogAuditActivity @EventType, @ObjectName, NULL, USER_ID();
+END;
+
+-- Trigger for data changes
+CREATE TRIGGER LogDataChanges
+ON DATABASE
+AFTER INSERT, UPDATE, DELETE
+AS
+BEGIN
+    DECLARE @TableName NVARCHAR(100) = OBJECT_NAME(@@PROCID);
+    DECLARE @UserID INT = USER_ID();
+
+    IF @TableName = 'Members' -- Customize for other tables as needed
+    BEGIN
+        DECLARE @RecordID INT;
+
+        -- Get the affected record's ID
+        SELECT @RecordID = MemberID FROM INSERTED; -- For INSERT
+        SELECT @RecordID = MemberID FROM DELETED; -- For UPDATE and DELETE
+
+        EXEC LogAuditActivity 'Data Change', @TableName, @RecordID, @UserID;
+    END;
+END;
+
+-- Trigger for user permission changes
+CREATE TRIGGER LogUserPermissionChanges
+ON ALL SERVER
+FOR ALTER_LOGIN, CREATE_LOGIN, DROP_LOGIN,
+    ALTER_USER, CREATE_USER, DROP_USER,
+    GRANT_SERVER, REVOKE_SERVER, DENY_SERVER,
+    GRANT_DATABASE, REVOKE_DATABASE, DENY_DATABASE,
+    GRANT_ADD_MEMBER, REVOKE_ADD_MEMBER, DENY_ADD_MEMBER,
+    GRANT_CONNECT_SQL, REVOKE_CONNECT_SQL, DENY_CONNECT_SQL
+AS
+BEGIN
+    DECLARE @EventData XML = EVENTDATA();
+    DECLARE @EventType NVARCHAR(100) = @EventData.value('(/EVENT_INSTANCE/EventType)[1]', 'NVARCHAR(100)');
+    DECLARE @ObjectName NVARCHAR(100) = @EventData.value('(/EVENT_INSTANCE/ObjectName)[1]', 'NVARCHAR(100)');
+
+    EXEC LogAuditActivity @EventType, @ObjectName, NULL, USER_ID();
+END;
+
+--To show all tables in db
+USE APU_SPORTS; -- Replace with your database name
+SELECT TABLE_NAME
+FROM INFORMATION_SCHEMA.TABLES
+WHERE TABLE_TYPE = 'BASE TABLE';
+
+---------------------
+-- DATA POPULATION---
+---------------------
+
+INSERT INTO Categories (CategoryID, CategoryName)
+VALUES
+    (1, 'Soccer'),
+    (2, 'Basketball'),
+    (3, 'Tennis'),
+    (4, 'Swimming'),
+    (5, 'Gymnastics');
+
+
+INSERT INTO Equipment (EquipmentID, EquipmentName, Price, CategoryID, QuantityInStock, CountryProduced, IsImported)
+VALUES
+    (1, 'Soccer Ball', 20.99, 1, 50, 'China', 1),
+    (2, 'Basketball Hoop', 150.00, 2, 10, 'USA', 0),
+    (3, 'Tennis Racket', 80.50, 3, 25, 'Japan', 1),
+    (4, 'Swimming Goggles', 15.00, 4, 100, 'Germany', 1),
+    (5, 'Gym Mat', 30.75, 5, 30, 'Canada', 0);
+
+
+INSERT INTO Members (MemberID, NationalIDOrPassport, Name, Address, PhoneNumber, MemberStatus, LoginID)
+VALUES
+    (1, ENCRYPTBYKEY(KEY_GUID('MemberKey'), 'ID123'), 'Alice Johnson', '456 Elm St', '555-123-4567', 'Active', 'alice_johnson'),
+    (2, ENCRYPTBYKEY(KEY_GUID('MemberKey'), 'ID456'), 'Bob Smith', '789 Oak Ave', '555-987-6543', 'Suspended', 'bob_smith'),
+    (3, ENCRYPTBYKEY(KEY_GUID('MemberKey'), 'ID789'), 'Eve Brown', '101 Pine Rd', '555-789-1234', 'Active', 'eve_brown'),
+    (4, ENCRYPTBYKEY(KEY_GUID('MemberKey'), 'ID321'), 'David Lee', '222 Maple Ln', '555-456-7890', 'Active', 'david_lee'),
+    (5, ENCRYPTBYKEY(KEY_GUID('MemberKey'), 'ID654'), 'Grace Miller', '333 Cedar Ct', '555-234-5678', 'Suspended', 'grace_miller');
+
+
+INSERT INTO Transactions (TransactionID, MemberID, TransactionDate)
+VALUES
+    (1, 1, '2023-07-01 10:00:00'),
+    (2, 2, '2023-07-02 14:30:00'),
+    (3, 3, '2023-07-03 11:45:00'),
+    (4, 4, '2023-07-04 09:15:00'),
+    (5, 5, '2023-07-05 16:00:00');
+
+
+INSERT INTO TransactionItems (TransactionItemID, TransactionID, EquipmentID, Quantity)
+VALUES
+    (1, 1, 1, 2),
+    (2, 2, 3, 1),
+    (3, 3, 5, 3),
+    (4, 4, 2, 1),
+    (5, 5, 4, 2);
+
+
+INSERT INTO Users (UserID, UserName, Password)
+VALUES
+    (1, 'MemberUser', 'MemberUserPassword'),
+    (2, 'ClerkUser', 'ClerkUserPassword'),
+    (3, 'DBAUser', 'DBAUserPassword'),
+    (4, 'ManagementUser', 'ManagementUserPassword');
+
+
+--SQL query/queries that can produce details of transactions that happen in 
+--the last n days where n = {1,2,…., 7}
+
+-- 1 DAY (AKASH)
+SELECT
+    T.TransactionID,
+    M.Name AS MemberName,
+    T.TransactionDate,
+    TI.EquipmentID,
+    E.EquipmentName,
+    TI.Quantity
+FROM Transactions T
+JOIN Members M ON T.MemberID = M.MemberID
+JOIN TransactionItems TI ON T.TransactionID = TI.TransactionID
+JOIN Equipment E ON TI.EquipmentID = E.EquipmentID
+WHERE T.TransactionDate >= DATEADD(DAY, -1, GETDATE());
+
+--2 DAYS (AWAIS)
+SELECT
+    T.TransactionID,
+    M.Name AS MemberName,
+    T.TransactionDate,
+    TI.EquipmentID,
+    E.EquipmentName,
+    TI.Quantity
+FROM Transactions T
+JOIN Members M ON T.MemberID = M.MemberID
+JOIN TransactionItems TI ON T.TransactionID = TI.TransactionID
+JOIN Equipment E ON TI.EquipmentID = E.EquipmentID
+WHERE T.TransactionDate >= DATEADD(DAY, -2, GETDATE());
+
+
+--3 DAYS (CELINE)
+SELECT
+    T.TransactionID,
+    M.Name AS MemberName,
+    T.TransactionDate,
+    TI.EquipmentID,
+    E.EquipmentName,
+    TI.Quantity
+FROM Transactions T
+JOIN Members M ON T.MemberID = M.MemberID
+JOIN TransactionItems TI ON T.TransactionID = TI.TransactionID
+JOIN Equipment E ON TI.EquipmentID = E.EquipmentID
+WHERE T.TransactionDate >= DATEADD(DAY, -3, GETDATE());
